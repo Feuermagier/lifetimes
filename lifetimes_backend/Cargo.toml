@@ -10,3 +10,4 @@ ide = { path = "../rust-analyzer/crates/ide" }
 vfs = { path = "../rust-analyzer/crates/vfs" }
 base_db = { path = "../rust-analyzer/crates/base_db" }
 hir = { path = "../rust-analyzer/crates/hir" }
+syntax = { path = "../rust-analyzer/crates/syntax" }

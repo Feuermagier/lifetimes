@@ -562,6 +562,7 @@ dependencies = [
  "base_db",
  "hir",
  "ide",
+ "syntax",
  "vfs",
 ]
 
