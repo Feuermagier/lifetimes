@@ -1,0 +1,12 @@
+[package]
+name = "lifetimes_backend"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ide = { path = "../rust-analyzer/crates/ide" }
+vfs = { path = "../rust-analyzer/crates/vfs" }
+base_db = { path = "../rust-analyzer/crates/base_db" }
+hir = { path = "../rust-analyzer/crates/hir" }
