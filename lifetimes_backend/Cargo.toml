@@ -6,6 +6,10 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+tracing-subscriber = "0.3.7"
+tracing = "0.1.29"
+profiling = {version = "1.0", features = ["profile-with-tracing"] }
+
 ide = { path = "../rust-analyzer/crates/ide" }
 vfs = { path = "../rust-analyzer/crates/vfs" }
 base_db = { path = "../rust-analyzer/crates/base_db" }
