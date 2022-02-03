@@ -1,16 +1,18 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+mod checker;
+mod polonius_checker;
 
-use base_db::{CrateOrigin, Env, FilePosition};
+use std::{borrow::BorrowMut, collections::HashMap, fmt::Debug, sync::Arc};
+
+use base_db::{CrateOrigin, Env};
+use checker::{VarId, Vars};
 use hir::{db::HirDatabase, CfgOptions, Semantics};
-use ide::{
-    AnalysisHost, AssistResolveStrategy, Change, CrateGraph, DiagnosticsConfig, Edition, FileId,
-    SourceRoot, TextSize,
-};
+use ide::{AnalysisHost, Change, CrateGraph, Edition, FileId, SourceRoot};
+use syntax::AstToken;
 use syntax::{
-    ast::{self, AstNode, TokenTree},
-    AstToken, Direction, NodeOrToken, SyntaxElement, SyntaxKind, SyntaxNode, T,
+    ast::{self, AstNode},
+    Direction,
 };
-use tracing_subscriber::filter::LevelFilter;
+
 use vfs::{file_set::FileSet, VfsPath};
 
 fn main() {
@@ -45,16 +47,15 @@ fn main() {
         Some(Arc::new(
             r#"
 fn main() {
-    let mut x = 5;
-    let y = &x;
-    let z = &mut x;
-    //*y = 3;
-    //x = 4;
-}"#
+    let mut x = 3;
+    let y = &mut x;
+    *y = 4;
+    let z = &*y;
+}
+"#
             .to_string(),
         )),
     );
-
     host.apply_change(initial_change);
 
     let analysis = host.analysis();
@@ -75,21 +76,18 @@ fn main() {
         syntax::TokenAtOffset::Between(lhs, rhs) => rhs,
     };
 
-    //dbg!(ast);
+    dbg!(ast);
 
-    let mut vars = HashMap::new();
+    let mut locals_map = HashMap::new();
+    let mut vars = Vars::new();
 
+    /*
     let local = semantics
         .to_def(&token.ancestors().find_map(ast::IdentPat::cast).unwrap())
         .unwrap();
-
-    vars.insert(
-        local,
-        Var {
-            status: VarStatus::Available,
-            borrows: vec![],
-        },
-    );
+    let var = vars.create_var(local, &semantics);
+    locals_map.insert(local, var);
+    */
 
     let parent_stmt = token.ancestors().find_map(ast::Stmt::cast).unwrap();
 
@@ -98,58 +96,166 @@ fn main() {
         .siblings(Direction::Next)
         .filter_map(ast::Stmt::cast)
     {
+        println!("\n\nProcessing '{}'", stmt.syntax().text());
         match stmt {
             ast::Stmt::ExprStmt(expr) => match expr.expr().unwrap() {
                 ast::Expr::BinExpr(bin_expr) => {
                     let lhs = bin_expr.lhs().unwrap();
                     let rhs = bin_expr.rhs().unwrap();
+                    match &lhs {
+                        ast::Expr::PathExpr(path) => {
+                            let local =
+                                resolve_local_ref(path.path().unwrap(), &semantics).unwrap();
+                            let lhs_var = *locals_map.get(&local).unwrap();
+                            process_assignment_rhs(
+                                &rhs,
+                                lhs_var,
+                                &mut vars,
+                                &locals_map,
+                                &semantics,
+                            );
+                            vars.resolve_var(lhs_var)
+                                .borrow_mut()
+                                .transition_initialized(&vars);
+                        }
+                        ast::Expr::PrefixExpr(prefix_expr) => {
+                            if prefix_expr.op_kind().unwrap() != ast::UnaryOp::Deref {
+                                todo!();
+                            }
+                            match &prefix_expr.expr().unwrap() {
+                                ast::Expr::PathExpr(path) => {
+                                    let local = resolve_local_ref(path.path().unwrap(), &semantics)
+                                        .unwrap();
+                                    let lhs_inner_var = *locals_map.get(&local).unwrap();
+                                    let lhs_var = vars.get_deref_var(lhs_inner_var);
+                                    
+                                    process_assignment_rhs(
+                                        &rhs,
+                                        lhs_var,
+                                        &mut vars,
+                                        &locals_map,
+                                        &semantics,
+                                    );
+                                    vars.resolve_var(lhs_var)
+                                        .borrow_mut()
+                                        .transition_initialized(&vars);
+                                }
+                                _ => todo!()
+                            }
+                        }
+                        _ => todo!(),
+                    }
                 }
                 _ => todo!(),
             },
             ast::Stmt::LetStmt(let_stmt) => {
                 if let ast::Pat::IdentPat(ident) = let_stmt.pat().unwrap() {
                     let new_local = semantics.to_def(&ident).unwrap();
-                    let mut new_var = Var { status: VarStatus::Available, borrows: vec![] };
-                    let init = let_stmt.initializer().unwrap();
-                    process_rhs(&init, &mut new_var, &mut vars, &semantics);
-                    vars.insert(new_local, new_var);
+                    let new_var = vars.create_var(
+                        ident.mut_token().is_some(),
+                        new_local
+                            .name(semantics.db)
+                            .unwrap()
+                            .as_text()
+                            .unwrap()
+                            .to_string(),
+                    );
+                    locals_map.insert(new_local, new_var);
+
+                    if let Some(init) = let_stmt.initializer() {
+                        process_assignment_rhs(&init, new_var, &mut vars, &locals_map, &semantics);
+                        vars.resolve_var(new_var)
+                            .borrow_mut()
+                            .transition_initialized(&vars);
+                    }
                 } else {
                     todo!();
                 }
             }
             ast::Stmt::Item(_) => todo!(),
         }
-    }
 
-    for (local, var) in vars {
-        let name = local.name(semantics.db).unwrap().as_text().unwrap();
-        println!("Local '{}' status: {:?}", name, var.status);
+        println!("{}", vars);
     }
 }
 
-fn process_rhs<'a, 'db, DB: HirDatabase>(
+fn process_assignment_rhs<'db, DB: HirDatabase>(
     rhs: &ast::Expr,
-    target: &mut Var,
-    vars: &mut HashMap<hir::Local, Var>,
+    lhs: VarId,
+    vars: &mut Vars,
+    locals_map: &HashMap<hir::Local, VarId>,
     sema: &Semantics<'db, DB>,
 ) {
     match rhs {
         ast::Expr::RefExpr(expr) => {
-            let is_mut_ref = expr.mut_token().is_some();
-            let local = match expr.expr().unwrap() {
-                ast::Expr::PathExpr(path) => resolve_local_ref(path.path().unwrap(), sema).unwrap(),
-                _ => todo!(),
-            };
-            let var = vars.get_mut(&local).unwrap();
-            match &mut var.status {
-                VarStatus::Available => var.status = if is_mut_ref { VarStatus::MutBorrowed } else { VarStatus::Borrowed(1) },
-                VarStatus::Borrowed(i) => if !is_mut_ref { *i += 1 } else { panic!("Mutably borrowing a var that is already borrowed")} , 
-                VarStatus::MutBorrowed => panic!("Borrowing a mutably borrowed var"),
-                VarStatus::Moved => panic!("Borrowing a moved var"),
-            }
-            target.borrows.push(local);
+            process_borrow_target(
+                &expr.expr().unwrap(),
+                lhs,
+                expr.mut_token().is_some(),
+                vars,
+                locals_map,
+                sema,
+            );
         }
-        _ => println!("Skipping {}", rhs.syntax().text()),
+        ast::Expr::Literal(_) => {}
+        ast::Expr::PathExpr(path) => {
+            let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
+            let var = *locals_map.get(&local).unwrap();
+            vars.resolve_var(var).borrow_mut().transition_moved(vars);
+        }
+        _ => todo!(),
+    }
+}
+
+fn process_borrow_target<'db, DB: HirDatabase>(
+    expr: &ast::Expr,
+    borrower: VarId,
+    is_mut_borrow: bool,
+    vars: &mut Vars,
+    locals_map: &HashMap<hir::Local, VarId>,
+    sema: &Semantics<'db, DB>,
+) {
+    match expr {
+        ast::Expr::Literal(_) => {}
+        ast::Expr::PathExpr(path) => {
+            let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
+            let mut target = vars
+                .resolve_var(*locals_map.get(&local).unwrap())
+                .borrow_mut();
+
+            if is_mut_borrow {
+                target.transition_mut_borrowed(borrower, vars);
+            } else {
+                target.transition_borrowed(borrower, vars);
+            }
+        }
+        ast::Expr::RefExpr(subexpr) => {
+            let target = vars.create_var(is_mut_borrow, format!("{}", &subexpr.syntax().text())); // Dunno it is correct that a anonymous var created by an immutable borrow is immutable
+            let is_mut_subborrow = subexpr.mut_token().is_some();
+
+            process_borrow_target(
+                &subexpr.expr().unwrap(),
+                target,
+                is_mut_subborrow,
+                vars,
+                locals_map,
+                sema,
+            );
+
+            let mut target = vars.resolve_var(target).borrow_mut();
+            if is_mut_borrow {
+                target.transition_mut_borrowed(borrower, vars);
+            } else {
+                target.transition_borrowed(borrower, vars);
+            }
+        },
+        ast::Expr::PrefixExpr(prefix_expr) => {
+            if prefix_expr.op_kind().unwrap() != ast::UnaryOp::Deref {
+                todo!();
+            }
+            todo!()
+        }
+        _ => todo!(),
     }
 }
 
@@ -161,18 +267,4 @@ fn resolve_local_ref<'db, DB: HirDatabase>(
         hir::PathResolution::Local(local) => Some(local),
         _ => None,
     }
-}
-
-#[derive(Debug)]
-struct Var {
-    status: VarStatus,
-    borrows: Vec<hir::Local>,
-}
-
-#[derive(Debug)]
-enum VarStatus {
-    Available,
-    Borrowed(u32),
-    MutBorrowed,
-    Moved,
 }

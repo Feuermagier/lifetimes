@@ -1,3 +1,6 @@
 [submodule "rust-analyzer"]
 	path = rust-analyzer
 	url = https://github.com/Feuermagier/rust-analyzer.git
+[submodule "polonius"]
+	path = polonius
+	url = https://github.com/rust-lang/polonius
