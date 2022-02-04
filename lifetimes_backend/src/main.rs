@@ -96,129 +96,102 @@ fn main() {
         .siblings(Direction::Next)
         .filter_map(ast::Stmt::cast)
     {
-        println!("\n\nProcessing '{}'", stmt.syntax().text());
-        match stmt {
-            ast::Stmt::ExprStmt(expr) => match expr.expr().unwrap() {
-                ast::Expr::BinExpr(bin_expr) => {
-                    let lhs = bin_expr.lhs().unwrap();
-                    let rhs = bin_expr.rhs().unwrap();
-                    match &lhs {
-                        ast::Expr::PathExpr(path) => {
-                            let local =
-                                resolve_local_ref(path.path().unwrap(), &semantics).unwrap();
-                            let lhs_var = *locals_map.get(&local).unwrap();
-                            process_assignment_rhs(
-                                &rhs,
-                                lhs_var,
-                                &mut vars,
-                                &locals_map,
-                                &semantics,
-                            );
-                            vars.resolve_var(lhs_var)
-                                .borrow_mut()
-                                .transition_initialized(&vars);
-                        }
-                        ast::Expr::PrefixExpr(prefix_expr) => {
-                            if prefix_expr.op_kind().unwrap() != ast::UnaryOp::Deref {
-                                todo!();
-                            }
-                            match &prefix_expr.expr().unwrap() {
-                                ast::Expr::PathExpr(path) => {
-                                    let local = resolve_local_ref(path.path().unwrap(), &semantics)
-                                        .unwrap();
-                                    let lhs_inner_var = *locals_map.get(&local).unwrap();
-                                    let lhs_var = vars.get_deref_var(lhs_inner_var);
-                                    
-                                    process_assignment_rhs(
-                                        &rhs,
-                                        lhs_var,
-                                        &mut vars,
-                                        &locals_map,
-                                        &semantics,
-                                    );
-                                    vars.resolve_var(lhs_var)
-                                        .borrow_mut()
-                                        .transition_initialized(&vars);
-                                }
-                                _ => todo!()
-                            }
-                        }
-                        _ => todo!(),
-                    }
-                }
-                _ => todo!(),
-            },
-            ast::Stmt::LetStmt(let_stmt) => {
-                if let ast::Pat::IdentPat(ident) = let_stmt.pat().unwrap() {
-                    let new_local = semantics.to_def(&ident).unwrap();
-                    let new_var = vars.create_var(
-                        ident.mut_token().is_some(),
-                        new_local
-                            .name(semantics.db)
-                            .unwrap()
-                            .as_text()
-                            .unwrap()
-                            .to_string(),
-                    );
-                    locals_map.insert(new_local, new_var);
-
-                    if let Some(init) = let_stmt.initializer() {
-                        process_assignment_rhs(&init, new_var, &mut vars, &locals_map, &semantics);
-                        vars.resolve_var(new_var)
-                            .borrow_mut()
-                            .transition_initialized(&vars);
-                    }
-                } else {
-                    todo!();
-                }
-            }
-            ast::Stmt::Item(_) => todo!(),
-        }
-
+        process_statement(&stmt, &mut vars, &mut locals_map, &semantics);
         println!("{}", vars);
     }
 }
 
-fn process_assignment_rhs<'db, DB: HirDatabase>(
-    rhs: &ast::Expr,
-    lhs: VarId,
+fn process_statement<'db, DB: HirDatabase>(
+    stmt: &ast::Stmt,
     vars: &mut Vars,
-    locals_map: &HashMap<hir::Local, VarId>,
+    locals_map: &mut HashMap<hir::Local, VarId>,
     sema: &Semantics<'db, DB>,
 ) {
-    match rhs {
-        ast::Expr::RefExpr(expr) => {
-            process_borrow_target(
-                &expr.expr().unwrap(),
-                lhs,
-                expr.mut_token().is_some(),
-                vars,
-                locals_map,
-                sema,
-            );
+    println!("\n\nProcessing '{}'", stmt.syntax().text());
+    match stmt {
+        ast::Stmt::ExprStmt(expr) => match expr.expr().unwrap() {
+            ast::Expr::BinExpr(bin_expr) => {
+                let lhs = bin_expr.lhs().unwrap();
+                let rhs = bin_expr.rhs().unwrap();
+                match &lhs {
+                    ast::Expr::PathExpr(path) => {
+                        let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
+                        let lhs_var = *locals_map.get(&local).unwrap();
+                        let rhs_var = resolve_borrow_target(&rhs, vars, locals_map, sema);
+                        vars.resolve_var(lhs_var)
+                            .borrow_mut()
+                            .transition_initialized(rhs_var, &vars);
+                    }
+                    ast::Expr::PrefixExpr(prefix_expr) => {
+                        if prefix_expr.op_kind().unwrap() != ast::UnaryOp::Deref {
+                            todo!();
+                        }
+                        match &prefix_expr.expr().unwrap() {
+                            ast::Expr::PathExpr(path) => {
+                                let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
+                                let lhs_inner_var = *locals_map.get(&local).unwrap();
+                                let lhs_var = vars.get_deref_var(lhs_inner_var);
+                                let rhs_var = resolve_borrow_target(&rhs, vars, locals_map, sema);
+                                vars.resolve_var(lhs_var)
+                                    .borrow_mut()
+                                    .transition_initialized(rhs_var, &vars);
+                            }
+                            _ => todo!(),
+                        }
+                    }
+                    _ => todo!(),
+                }
+            }
+            _ => todo!(),
+        },
+        ast::Stmt::LetStmt(let_stmt) => {
+            if let ast::Pat::IdentPat(ident) = let_stmt.pat().unwrap() {
+                let new_local = sema.to_def(&ident).unwrap();
+                /*
+                let is_copy = sema
+                    .type_of_pat(&ident.pat().unwrap())
+                    .unwrap()
+                    .original()
+                    .is_copy(sema.db);
+                    */
+                let new_var = vars.create_var(
+                    ident.mut_token().is_some(),
+                    false, // TODO
+                    new_local
+                        .name(sema.db)
+                        .unwrap()
+                        .as_text()
+                        .unwrap()
+                        .to_string(),
+                );
+                locals_map.insert(new_local, new_var);
+
+                if let Some(init) = let_stmt.initializer() {
+                    let rhs = resolve_borrow_target(&init, vars, locals_map, sema);
+                    vars.resolve_var(new_var)
+                        .borrow_mut()
+                        .transition_initialized(rhs, &vars);
+                }
+            } else {
+                todo!();
+            }
         }
-        ast::Expr::Literal(_) => {}
-        ast::Expr::PathExpr(path) => {
-            let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
-            let var = *locals_map.get(&local).unwrap();
-            vars.resolve_var(var).borrow_mut().transition_moved(vars);
-        }
-        _ => todo!(),
+        ast::Stmt::Item(_) => todo!(),
     }
 }
 
-fn process_borrow_target<'db, DB: HirDatabase>(
+fn resolve_borrow_target<'db, DB: HirDatabase>(
     expr: &ast::Expr,
-    borrower: VarId,
-    is_mut_borrow: bool,
     vars: &mut Vars,
     locals_map: &HashMap<hir::Local, VarId>,
     sema: &Semantics<'db, DB>,
-) {
+) -> VarId {
     match expr {
-        ast::Expr::Literal(_) => {}
+        ast::Expr::Literal(literal) => vars.create_literal(literal.syntax().text().to_string()),
         ast::Expr::PathExpr(path) => {
             let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
+            *locals_map.get(&local).unwrap()
+            /*
             let mut target = vars
                 .resolve_var(*locals_map.get(&local).unwrap())
                 .borrow_mut();
@@ -228,32 +201,33 @@ fn process_borrow_target<'db, DB: HirDatabase>(
             } else {
                 target.transition_borrowed(borrower, vars);
             }
+            */
         }
         ast::Expr::RefExpr(subexpr) => {
-            let target = vars.create_var(is_mut_borrow, format!("{}", &subexpr.syntax().text())); // Dunno it is correct that a anonymous var created by an immutable borrow is immutable
-            let is_mut_subborrow = subexpr.mut_token().is_some();
+            let is_mut_borrow = subexpr.mut_token().is_some();
 
-            process_borrow_target(
-                &subexpr.expr().unwrap(),
-                target,
-                is_mut_subborrow,
-                vars,
-                locals_map,
-                sema,
-            );
+            let tmp =
+                vars.create_ref_tmp(is_mut_borrow, subexpr.syntax().text().to_string()); // Dunno if it is correct that a tmp var created by an immutable borrow is immutable
 
+            let target = resolve_borrow_target(&subexpr.expr().unwrap(), vars, locals_map, sema);
             let mut target = vars.resolve_var(target).borrow_mut();
+
             if is_mut_borrow {
-                target.transition_mut_borrowed(borrower, vars);
+                target.transition_mut_borrowed(tmp, vars);
             } else {
-                target.transition_borrowed(borrower, vars);
+                target.transition_borrowed(tmp, vars);
             }
-        },
+
+            tmp
+        }
         ast::Expr::PrefixExpr(prefix_expr) => {
             if prefix_expr.op_kind().unwrap() != ast::UnaryOp::Deref {
                 todo!();
             }
-            todo!()
+            let target =
+                resolve_borrow_target(&prefix_expr.expr().unwrap(), vars, locals_map, sema);
+
+            vars.get_deref_var(target)
         }
         _ => todo!(),
     }

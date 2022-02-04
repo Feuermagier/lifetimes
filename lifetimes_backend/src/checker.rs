@@ -22,12 +22,39 @@ impl Vars {
         Self { vars: Vec::new() }
     }
 
-    pub fn create_var(&mut self, is_mut: bool, identifier: String) -> VarId {
+    pub fn create_var(&mut self, is_mut: bool, is_copy: bool, identifier: String) -> VarId {
         self.add_var(Var {
             status: VarStatus::Unitialized,
             valid: true,
             is_mut,
+            is_copy,
             identifier,
+            id: VarId(0),
+            deref_var: None,
+            parent: None,
+        })
+    }
+    
+    pub fn create_literal(&mut self, text: String) -> VarId {
+        self.add_var(Var {
+            status: VarStatus::Initialized,
+            valid: true,
+            identifier: "<literal> ".to_string() + &text,
+            is_mut: false,
+            is_copy: true,
+            id: VarId(0),
+            deref_var: None,
+            parent: None,
+        })
+    }
+
+    pub fn create_ref_tmp(&mut self, is_mut: bool, text: String) -> VarId {
+        self.add_var(Var {
+            status: VarStatus::Initialized,
+            valid: true,
+            identifier: "<tmp> ".to_string() + &text,
+            is_mut,
+            is_copy: true,
             id: VarId(0),
             deref_var: None,
             parent: None,
@@ -46,6 +73,7 @@ impl Vars {
                 valid: true,
                 identifier,
                 is_mut,
+                is_copy: false, // TODO TODO TODO
                 id: VarId(0),
                 deref_var: None,
                 parent: Some(derefed_var),
@@ -73,6 +101,7 @@ pub struct Var {
     valid: bool,
     identifier: String,
     is_mut: bool,
+    is_copy: bool,
     id: VarId,
     deref_var: Option<VarId>,
     parent: Option<VarId>,
@@ -93,7 +122,7 @@ impl Var {
         }
     }
 
-    pub fn transition_initialized(&mut self, vars: &Vars) {
+    pub fn transition_initialized(&mut self, value_source: VarId, vars: &Vars) {
         match &self.status {
             VarStatus::Borrowed(borrowers) => borrowers
                 .iter()
@@ -111,6 +140,7 @@ impl Var {
         }
         self.status = VarStatus::Initialized;
         self.valid = true;
+        vars.resolve_var(value_source).borrow_mut().transition_moved(vars);
     }
 
     pub fn transition_mut_borrowed(&mut self, borrower: VarId, vars: &Vars) {
@@ -150,6 +180,10 @@ impl Var {
 
     pub fn transition_moved(&mut self, vars: &Vars) {
         self.assert_usable();
+
+        if self.is_copy {
+            return;
+        }
 
         match &self.status {
             VarStatus::Initialized => {}
