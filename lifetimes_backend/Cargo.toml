@@ -9,6 +9,10 @@ edition = "2021"
 tracing-subscriber = "0.3.7"
 tracing = "0.1.29"
 profiling = {version = "1.0", features = ["profile-with-tracing"] }
+log = "0.4"
+env_logger = "0.9"
+
+thiserror = "1.0"
 
 ide = { path = "../rust-analyzer/crates/ide" }
 vfs = { path = "../rust-analyzer/crates/vfs" }

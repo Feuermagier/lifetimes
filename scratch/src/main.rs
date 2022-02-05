@@ -2,11 +2,9 @@
 struct A(u32);
 
 fn main() {
-
-    let mut x = 3;
+    let mut x = 42;
     let y = &mut x;
-    *y = 4;
-    let z = &*y;
+    let z = &mut x;
 
     // Why??
     /*
