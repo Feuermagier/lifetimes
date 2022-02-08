@@ -1,8 +1,8 @@
-use std::{cell::RefCell, fmt::Debug, fmt::Display};
+use std::{fmt::Display, cell::RefCell};
 
 use log::{debug, trace};
 
-pub(crate) type CheckerResult = Result<(), CheckerError>;
+use super::{CheckerError, CheckerResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VarId(usize);
@@ -14,7 +14,7 @@ impl Display for VarId {
 }
 
 #[derive(Debug)]
-pub(crate) struct Vars {
+pub struct Vars {
     vars: Vec<RefCell<Var>>,
 }
 
@@ -33,7 +33,13 @@ impl Vars {
         Self { vars: Vec::new() }
     }
 
-    pub(crate) fn create_var(&mut self, is_mut: bool, is_copy: bool, identifier: String) -> VarId {
+    pub fn create_var(
+        &mut self,
+        origin: OriginId,
+        is_mut: bool,
+        is_copy: bool,
+        identifier: String,
+    ) -> VarId {
         self.add_var(Var {
             status: VarStatus::Unitialized,
             valid: true,
@@ -44,11 +50,12 @@ impl Vars {
             deref_var: None,
             parent: None,
             borrows: Borrows::None,
+            origin,
         })
     }
 
     /// For refs (i.e. assumes the value is copy)
-    pub(crate) fn create_tmp(&mut self, is_mut: bool, text: String) -> VarId {
+    pub fn create_tmp(&mut self, origin: OriginId, is_mut: bool, text: String) -> VarId {
         self.add_var(Var {
             status: VarStatus::Unitialized,
             valid: true,
@@ -59,10 +66,11 @@ impl Vars {
             deref_var: None,
             parent: None,
             borrows: Borrows::None,
+            origin,
         })
     }
 
-    pub fn create_literal(&mut self, literal: String) -> VarId {
+    pub fn create_literal(&mut self, origin: OriginId, literal: String) -> VarId {
         self.add_var(Var {
             status: VarStatus::Initialized,
             valid: true,
@@ -73,6 +81,7 @@ impl Vars {
             deref_var: None,
             parent: None,
             borrows: Borrows::None,
+            origin,
         })
     }
 
@@ -83,6 +92,7 @@ impl Vars {
         } else {
             let is_mut = self.resolve_var(derefed_var).borrow().is_mut;
             let identifier = "*".to_string() + &self.resolve_var(derefed_var).borrow().identifier;
+            let origin = self.resolve_var(derefed_var).borrow().origin;
             let deref_var = self.add_var(Var {
                 status: VarStatus::Unitialized,
                 valid: true,
@@ -93,6 +103,7 @@ impl Vars {
                 deref_var: None,
                 parent: Some(derefed_var),
                 borrows: Borrows::None,
+                origin,
             });
             self.resolve_var(derefed_var).borrow_mut().deref_var = Some(deref_var);
             deref_var
@@ -113,7 +124,7 @@ impl Vars {
 }
 
 #[derive(Debug)]
-pub(crate) struct Var {
+pub struct Var {
     status: VarStatus,
     valid: bool,
     identifier: String,
@@ -123,6 +134,7 @@ pub(crate) struct Var {
     deref_var: Option<VarId>,
     parent: Option<VarId>,
     borrows: Borrows,
+    origin: OriginId,
 }
 
 impl Var {
@@ -162,6 +174,34 @@ impl Var {
         }
     }
 
+    pub fn validate_for_origin(
+        &self,
+        origin: OriginId,
+        origins: &Origins,
+        vars: &Vars,
+    ) -> CheckerResult {
+        match &self.borrows {
+            Borrows::Mutable(borrows) | Borrows::Immutable(borrows) => {
+                for var in borrows {
+                    if !vars
+                        .resolve_var(*var)
+                        .borrow()
+                        .origin
+                        .has_parent(origin, origins)
+                    {
+                        return Err(CheckerError::InvalidOrigin(
+                            self.identifier.to_string(),
+                            self.id,
+                            origin,
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            Borrows::None => Ok(()),
+        }
+    }
+
     /*
         1. Make sure self can be assigned to (i.e. it is either uninitialized or mutable)
         2. Because this value will be dropped, all borrowers are invalidated
@@ -179,7 +219,8 @@ impl Var {
         self.status = VarStatus::Initialized;
         self.valid = true;
 
-        self.borrows = vars.resolve_var(value_source)
+        self.borrows = vars
+            .resolve_var(value_source)
             .borrow_mut()
             .transition_moved(vars)?; // This must be done before copying the source_status, because value_source will be invalidated while doing so and the move will fail
         drop(value_source); // Because value_source is now moved, it must not been used later in this fn
@@ -188,15 +229,15 @@ impl Var {
             Borrows::Mutable(borrows) => {
                 for borrow in borrows {
                     vars.resolve_var(*borrow)
-                    .borrow_mut()
-                    .transition_mut_borrowed(self.id, vars)?;
+                        .borrow_mut()
+                        .transition_mut_borrowed(self.id, vars)?;
                 }
             }
             Borrows::Immutable(borrows) => {
                 for borrow in borrows {
                     vars.resolve_var(*borrow)
-                    .borrow_mut()
-                    .transition_borrowed(self.id, vars)?;
+                        .borrow_mut()
+                        .transition_borrowed(self.id, vars)?;
                 }
             }
             Borrows::None => self.borrows = Borrows::None,
@@ -382,20 +423,52 @@ enum Borrows {
     None,
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum CheckerError {
-    #[error("Local '{0}' {1} is not valid anymore")]
-    Invalid(String, VarId),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OriginId(usize);
 
-    #[error("Local '{0}' {1} has not yet been initialized")]
-    Uninitialized(String, VarId),
+pub struct Origins {
+    parent_origins: Vec<Option<OriginId>>,
+}
 
-    #[error("Local '{0}' {1} has been moved")]
-    Moved(String, VarId),
+impl Origins {
+    pub fn new() -> Self {
+        Self {
+            parent_origins: Vec::new(),
+        }
+    }
 
-    #[error("Local '{0}' {1} is immutable, so exactly one assignment is allowed")]
-    ImmutableAssigned(String, VarId),
+    pub fn create_unbound_origin(&mut self) -> OriginId {
+        let id = self.parent_origins.len();
+        self.parent_origins.push(None);
+        OriginId(id)
+    }
 
-    #[error("Local '{0}' {1} is immutable, so it cannot be borrowed mutably")]
-    ImmutableBorrowedMutable(String, VarId),
+    pub fn create_bound_origin(&mut self, parent: OriginId) -> OriginId {
+        let id = self.parent_origins.len();
+        self.parent_origins.push(Some(parent));
+        OriginId(id)
+    }
+
+    pub fn resolve_parent(&self, origin: OriginId) -> Option<OriginId> {
+        self.parent_origins[origin.0]
+    }
+}
+
+impl OriginId {
+    fn has_parent(self, parent: OriginId, origins: &Origins) -> bool {
+        let mut origin = self;
+        while let Some(p) = origins.resolve_parent(origin) {
+            if p == parent {
+                return true;
+            }
+            origin = p;
+        }
+        false
+    }
+}
+
+impl Display for OriginId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "#{}", self.0)
+    }
 }

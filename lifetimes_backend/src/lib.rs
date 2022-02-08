@@ -4,7 +4,7 @@ mod polonius_checker;
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
 use base_db::{CrateOrigin, Env};
-use checker::{CheckerError, VarId, Vars};
+use checker::{Checker, CheckerError, VarId};
 use hir::{db::HirDatabase, CfgOptions, Semantics};
 use ide::{AnalysisHost, Change, CrateGraph, Edition, FileId, SourceRoot};
 use log::info;
@@ -45,7 +45,7 @@ pub fn check(code: String) -> Result<(), CheckError> {
     //dbg!(file_node.syntax());
 
     let mut locals_map = HashMap::new();
-    let mut vars = Vars::new();
+    let mut checker = Checker::new();
 
     let main = file_node
         .syntax()
@@ -54,11 +54,15 @@ pub fn check(code: String) -> Result<(), CheckError> {
         .find(|function| function.name().unwrap().text() == "main")
         .expect("no function naimed 'main' found");
 
-    for stmt in main.body().unwrap().stmt_list().unwrap().statements()
-    {
+    for stmt in main.body().unwrap().stmt_list().unwrap().statements() {
         info!("Processing '{}'", stmt.syntax().text());
-        process_statement(&stmt, &mut vars, &mut locals_map, &semantics)?;
-        info!("\n{}", vars);
+        process_statement(
+            &stmt,
+            &mut checker,
+            &mut locals_map,
+            &semantics,
+        )?;
+        info!("\n{}", checker);
     }
 
     Ok(())
@@ -66,7 +70,7 @@ pub fn check(code: String) -> Result<(), CheckError> {
 
 fn process_statement<'db, DB: HirDatabase>(
     stmt: &ast::Stmt,
-    vars: &mut Vars,
+    checker: &mut Checker,
     locals_map: &mut HashMap<hir::Local, VarId>,
     sema: &Semantics<'db, DB>,
 ) -> Result<(), CheckError> {
@@ -79,10 +83,9 @@ fn process_statement<'db, DB: HirDatabase>(
                     ast::Expr::PathExpr(path) => {
                         let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
                         let lhs_var = *locals_map.get(&local).unwrap();
-                        let rhs_var = resolve_borrow_target(&rhs, vars, locals_map, sema)?;
-                        vars.resolve_var(lhs_var)
-                            .borrow_mut()
-                            .initialize_with_value(rhs_var, &vars)?;
+                        let rhs_var =
+                            resolve_borrow_target(&rhs, checker, locals_map, sema)?;
+                        checker.initialize_var_with_value(lhs_var, rhs_var)?;
                     }
                     ast::Expr::PrefixExpr(prefix_expr) => {
                         if prefix_expr.op_kind().unwrap() != ast::UnaryOp::Deref {
@@ -92,22 +95,25 @@ fn process_statement<'db, DB: HirDatabase>(
                             ast::Expr::PathExpr(path) => {
                                 let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
                                 let lhs_inner_var = *locals_map.get(&local).unwrap();
-                                let lhs_var = vars.get_deref_var(lhs_inner_var);
-                                let rhs_var = resolve_borrow_target(&rhs, vars, locals_map, sema)?;
-                                vars.resolve_var(lhs_var)
-                                    .borrow_mut()
-                                    .initialize_with_value(rhs_var, &vars)?;
+                                let lhs_var = checker.get_deref_var(lhs_inner_var);
+                                let rhs_var = resolve_borrow_target(
+                                    &rhs,
+                                    checker,
+                                    locals_map,
+                                    sema,
+                                )?;
+                                checker.initialize_var_with_value(lhs_var, rhs_var)?;
                             }
                             _ => todo!(),
                         }
                     }
                     _ => todo!(),
                 }
-            },
+            }
             ast::Expr::PathExpr(expr) => {
                 let local = resolve_local_ref(expr.path().unwrap(), sema).unwrap();
                 let var = *locals_map.get(&local).unwrap();
-                vars.resolve_var(var).borrow().assert_usable()?;
+                checker.check_var_usable(var)?;
             }
             _ => todo!(),
         },
@@ -121,7 +127,7 @@ fn process_statement<'db, DB: HirDatabase>(
                     .original()
                     .is_copy(sema.db);
                     */
-                let new_var = vars.create_var(
+                let new_var = checker.create_var(
                     ident.mut_token().is_some(),
                     false, // TODO
                     new_local
@@ -134,10 +140,8 @@ fn process_statement<'db, DB: HirDatabase>(
                 locals_map.insert(new_local, new_var);
 
                 if let Some(init) = let_stmt.initializer() {
-                    let rhs = resolve_borrow_target(&init, vars, locals_map, sema)?;
-                    vars.resolve_var(new_var)
-                        .borrow_mut()
-                        .initialize_with_value(rhs, &vars)?;
+                    let rhs = resolve_borrow_target(&init, checker, locals_map, sema)?;
+                    checker.initialize_var_with_value(new_var, rhs)?;
                 }
             } else {
                 todo!();
@@ -150,12 +154,14 @@ fn process_statement<'db, DB: HirDatabase>(
 
 fn resolve_borrow_target<'db, DB: HirDatabase>(
     expr: &ast::Expr,
-    vars: &mut Vars,
+    checker: &mut Checker,
     locals_map: &HashMap<hir::Local, VarId>,
     sema: &Semantics<'db, DB>,
 ) -> Result<VarId, CheckError> {
     match expr {
-        ast::Expr::Literal(literal) => Ok(vars.create_literal(literal.syntax().text().to_string())),
+        ast::Expr::Literal(literal) => {
+            Ok(checker.create_literal(literal.syntax().text().to_string()))
+        }
         ast::Expr::PathExpr(path) => {
             let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
             Ok(*locals_map.get(&local).unwrap())
@@ -163,14 +169,11 @@ fn resolve_borrow_target<'db, DB: HirDatabase>(
         ast::Expr::RefExpr(subexpr) => {
             let is_mut_borrow = subexpr.mut_token().is_some();
 
-            let tmp = vars.create_tmp(is_mut_borrow, subexpr.syntax().text().to_string()); // Dunno if it is correct that a tmp var created by an immutable borrow is immutable
+            let tmp = checker.create_ref_tmp(is_mut_borrow, subexpr.syntax().text().to_string()); // Dunno if it is correct that a tmp var created by an immutable borrow is immutable
 
-            let target = resolve_borrow_target(&subexpr.expr().unwrap(), vars, locals_map, sema)?;
-            vars.resolve_var(tmp).borrow_mut().initialize_with_borrow(
-                is_mut_borrow,
-                target,
-                vars,
-            )?;
+            let target =
+                resolve_borrow_target(&subexpr.expr().unwrap(), checker, locals_map, sema)?;
+            checker.initialize_var_with_borrow(tmp, target, is_mut_borrow)?;
 
             Ok(tmp)
         }
@@ -179,9 +182,9 @@ fn resolve_borrow_target<'db, DB: HirDatabase>(
                 todo!();
             }
             let target =
-                resolve_borrow_target(&prefix_expr.expr().unwrap(), vars, locals_map, sema)?;
+                resolve_borrow_target(&prefix_expr.expr().unwrap(), checker, locals_map, sema)?;
 
-            Ok(vars.get_deref_var(target))
+            Ok(checker.get_deref_var(target))
         }
         _ => todo!(),
     }
