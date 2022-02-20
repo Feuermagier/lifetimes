@@ -2,9 +2,14 @@
 struct A(u32);
 
 fn main() {
-    let mut x = 42;
-    let y = &mut x;
-    let z = &mut x;
+    let mut a = 1;
+    let mut b = 2;
+
+    let x = if true {
+        &mut a
+    } else {
+        &b
+    };
 
     // Why??
     /*

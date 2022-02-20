@@ -1,4 +1,4 @@
-use std::{fmt::Display, cell::RefCell};
+use std::{cell::RefCell, fmt::Display};
 
 use log::{debug, trace};
 
@@ -15,6 +15,7 @@ impl Display for VarId {
 
 #[derive(Debug)]
 pub struct Vars {
+    void_literal: VarId,
     vars: Vec<RefCell<Var>>,
 }
 
@@ -29,8 +30,26 @@ impl Display for Vars {
 }
 
 impl Vars {
-    pub fn new() -> Self {
-        Self { vars: Vec::new() }
+    pub fn new(static_origin: OriginId) -> Self {
+        Self {
+            vars: vec![RefCell::new(Var {
+                status: VarStatus::Initialized,
+                valid: true,
+                identifier: "()".to_string(),
+                is_mut: false,
+                is_copy: true,
+                id: VarId(0),
+                deref_var: None,
+                parent: None,
+                borrows: Vec::new(),
+                origin: static_origin,
+            })],
+            void_literal: VarId(0),
+        }
+    }
+
+    pub fn void_literal(&self) -> VarId {
+        self.void_literal
     }
 
     pub fn create_var(
@@ -49,7 +68,7 @@ impl Vars {
             id: VarId(0),
             deref_var: None,
             parent: None,
-            borrows: Borrows::None,
+            borrows: Vec::new(),
             origin,
         })
     }
@@ -65,7 +84,7 @@ impl Vars {
             id: VarId(0),
             deref_var: None,
             parent: None,
-            borrows: Borrows::None,
+            borrows: Vec::new(),
             origin,
         })
     }
@@ -80,7 +99,7 @@ impl Vars {
             id: VarId(0),
             deref_var: None,
             parent: None,
-            borrows: Borrows::None,
+            borrows: Vec::new(),
             origin,
         })
     }
@@ -102,7 +121,7 @@ impl Vars {
                 id: VarId(0),
                 deref_var: None,
                 parent: Some(derefed_var),
-                borrows: Borrows::None,
+                borrows: Vec::new(),
                 origin,
             });
             self.resolve_var(derefed_var).borrow_mut().deref_var = Some(deref_var);
@@ -133,7 +152,7 @@ pub struct Var {
     id: VarId,
     deref_var: Option<VarId>,
     parent: Option<VarId>,
-    borrows: Borrows,
+    borrows: Vec<Borrow>,
     origin: OriginId,
 }
 
@@ -180,37 +199,24 @@ impl Var {
         origins: &Origins,
         vars: &Vars,
     ) -> CheckerResult {
-        match &self.borrows {
-            Borrows::Mutable(borrows) | Borrows::Immutable(borrows) => {
-                for var in borrows {
-                    if !vars
-                        .resolve_var(*var)
-                        .borrow()
-                        .origin
-                        .has_parent(origin, origins)
-                    {
-                        return Err(CheckerError::InvalidOrigin(
-                            self.identifier.to_string(),
-                            self.id,
-                            origin,
-                        ));
-                    }
-                }
-                Ok(())
-            }
-            Borrows::None => Ok(()),
-        }
+        // TODO
+        Ok(())
     }
 
     /*
         1. Make sure self can be assigned to (i.e. it is either uninitialized or mutable)
         2. Because this value will be dropped, all borrowers are invalidated
         3. The status of self is updated
-        4. The value_source is transitioned into a moved state (and invalidated by doing so if is not copy)
-        5. If value_source borrowed vars, self's the borrowed vars are updated to reflect that self now also borrows them
+        4. The value_sources are transitioned into a moved state (and invalidated by doing so if they are not copy)
+        5. If the value_sources borrowed vars, self's borrowed vars are updated to reflect that self now also borrows them
     */
-    pub fn initialize_with_value(&mut self, value_source: VarId, vars: &Vars) -> CheckerResult {
-        debug!("Initializing {} from {}", self.id, value_source);
+    /// value_sources must contain at least one value
+    pub fn initialize_with_values(
+        &mut self,
+        value_sources: Vec<VarId>,
+        vars: &Vars,
+    ) -> CheckerResult {
+        debug!("Initializing {} from {:?}", self.id, value_sources);
 
         self.assert_assignable()?;
 
@@ -219,28 +225,30 @@ impl Var {
         self.status = VarStatus::Initialized;
         self.valid = true;
 
-        self.borrows = vars
-            .resolve_var(value_source)
-            .borrow_mut()
-            .transition_moved(vars)?; // This must be done before copying the source_status, because value_source will be invalidated while doing so and the move will fail
-        drop(value_source); // Because value_source is now moved, it must not been used later in this fn
+        self.borrows = Vec::new();
 
-        match &self.borrows {
-            Borrows::Mutable(borrows) => {
-                for borrow in borrows {
+        for value_source in value_sources {
+            self.borrows.extend(
+                vars.resolve_var(value_source)
+                    .borrow_mut()
+                    .transition_moved(vars)?,
+            );
+        }
+
+        // Notify all variables that are now borrowed by us of their new borrower
+        for borrow in &self.borrows {
+            match borrow {
+                Borrow::Mutable(borrow) => {
                     vars.resolve_var(*borrow)
                         .borrow_mut()
                         .transition_mut_borrowed(self.id, vars)?;
                 }
-            }
-            Borrows::Immutable(borrows) => {
-                for borrow in borrows {
+                Borrow::Immutable(borrow) => {
                     vars.resolve_var(*borrow)
                         .borrow_mut()
                         .transition_borrowed(self.id, vars)?;
                 }
             }
-            Borrows::None => self.borrows = Borrows::None,
         }
 
         Ok(())
@@ -250,15 +258,15 @@ impl Var {
         1. Make sure self can be assigned to (i.e. it is either uninitialized or mutable)
         2. Because this value will be dropped, all borrowers are invalidated
         3. The status of self is updated
-        4. borrowed_var is updated to reflect that this now borrows it
+        4. borrowed_vars are updated to reflect that self now borrows them
     */
-    pub fn initialize_with_borrow(
+    pub fn initialize_with_borrows(
         &mut self,
         is_mut: bool,
-        borrowed_var: VarId,
+        borrowed_vars: Vec<VarId>,
         vars: &Vars,
     ) -> CheckerResult {
-        debug!("Initializing {} as a borrow from {}", self.id, borrowed_var);
+        debug!("Initializing {} as a borrow from {:?}", self.id, borrowed_vars);
 
         self.assert_assignable()?;
 
@@ -267,16 +275,19 @@ impl Var {
         self.status = VarStatus::Initialized;
         self.valid = true;
 
-        if is_mut {
-            self.borrows = Borrows::Mutable(vec![borrowed_var]);
-            vars.resolve_var(borrowed_var)
-                .borrow_mut()
-                .transition_mut_borrowed(self.id, vars)?;
-        } else {
-            self.borrows = Borrows::Immutable(vec![borrowed_var]);
-            vars.resolve_var(borrowed_var)
-                .borrow_mut()
-                .transition_borrowed(self.id, vars)?;
+        self.borrows = Vec::with_capacity(borrowed_vars.len());
+        for borrowed_var in borrowed_vars {
+            if is_mut {
+                self.borrows.push(Borrow::Mutable(borrowed_var));
+                vars.resolve_var(borrowed_var)
+                    .borrow_mut()
+                    .transition_mut_borrowed(self.id, vars)?;
+            } else {
+                self.borrows.push(Borrow::Immutable(borrowed_var));
+                vars.resolve_var(borrowed_var)
+                    .borrow_mut()
+                    .transition_borrowed(self.id, vars)?;
+            }
         }
 
         Ok(())
@@ -327,7 +338,7 @@ impl Var {
     }
 
     // Returns the status of self to replicate it in the var that received the move
-    fn transition_moved(&mut self, vars: &Vars) -> Result<Borrows, CheckerError> {
+    fn transition_moved(&mut self, vars: &Vars) -> Result<Vec<Borrow>, CheckerError> {
         trace!("{} got moved", self.id);
 
         self.assert_usable()?;
@@ -346,9 +357,8 @@ impl Var {
         }
 
         self.status = VarStatus::Moved;
-        self.borrows = Borrows::None;
 
-        Ok(std::mem::replace(&mut self.borrows, Borrows::None))
+        Ok(std::mem::replace(&mut self.borrows, Vec::new()))
     }
 
     fn invalidate_var(&self, var: VarId, vars: &Vars) {
@@ -356,14 +366,19 @@ impl Var {
     }
 
     fn invalidate(&mut self, invalidated_by: VarId, vars: &Vars) {
-        match &self.borrows {
-            Borrows::Mutable(borrows) | Borrows::Immutable(borrows) => {
-                if !borrows.contains(&invalidated_by) {
-                    return;
+        let mut invalidator_found = false;
+        for borrow in &self.borrows {
+            match borrow {
+                Borrow::Mutable(borrow) | Borrow::Immutable(borrow) => {
+                    if *borrow == invalidated_by {
+                        invalidator_found = true;
+                    }
                 }
             }
-            Borrows::None => return,
-        };
+        }
+        if !invalidator_found {
+            return;
+        }
         trace!("{} got invalidated by {}", self.id, invalidated_by);
 
         self.valid = false;
@@ -395,12 +410,7 @@ impl Display for Var {
                 self.identifier, self.id.0, self.status
             ))?;
 
-            match &self.borrows {
-                Borrows::Mutable(borrows) | Borrows::Immutable(borrows) => {
-                    f.write_str(&format!(" (borrows {:?})", borrows))?
-                }
-                Borrows::None => {}
-            }
+            f.write_str(&format!(" (borrows {:?})", self.borrows))?;
 
             Ok(())
         }
@@ -417,10 +427,9 @@ enum VarStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Borrows {
-    Mutable(Vec<VarId>),
-    Immutable(Vec<VarId>),
-    None,
+enum Borrow {
+    Mutable(VarId),
+    Immutable(VarId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

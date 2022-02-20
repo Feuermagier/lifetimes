@@ -7,15 +7,5 @@ fn main() {
         .filter_module("lifetimes_backend", log::LevelFilter::Trace)
         .init();
 
-    check(
-        r#"
-        fn main() {
-            let mut x = 42;
-            let y = &mut x;
-            let z = &mut x;
-        }
-"#
-        .to_string(),
-    )
-    .unwrap();
+    check(std::fs::read_to_string("../scratch/src/main.rs").unwrap()).unwrap();
 }

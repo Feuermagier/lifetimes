@@ -52,20 +52,42 @@ pub fn check(code: String) -> Result<(), CheckError> {
         .children()
         .filter_map(ast::Fn::cast)
         .find(|function| function.name().unwrap().text() == "main")
-        .expect("no function naimed 'main' found");
+        .expect("no function named 'main' found");
 
-    for stmt in main.body().unwrap().stmt_list().unwrap().statements() {
+    checker.enter_function(checker.static_origin());
+    process_block(
+        &main.body().unwrap(),
+        &mut checker,
+        &mut locals_map,
+        &semantics,
+    )?;
+
+    Ok(())
+}
+
+fn process_block<'db, DB: HirDatabase>(
+    block: &ast::BlockExpr,
+    checker: &mut Checker,
+    locals_map: &mut HashMap<hir::Local, VarId>,
+    sema: &Semantics<'db, DB>,
+) -> Result<VarId, CheckError> {
+    checker.enter_scope();
+
+    for stmt in block.stmt_list().unwrap().statements() {
         info!("Processing '{}'", stmt.syntax().text());
-        process_statement(
-            &stmt,
-            &mut checker,
-            &mut locals_map,
-            &semantics,
-        )?;
+        process_statement(&stmt, checker, locals_map, sema)?;
         info!("\n{}", checker);
     }
 
-    Ok(())
+    let return_var = if let Some(expr) = block.tail_expr() {
+        Some(resolve_borrow_target(&expr, checker, locals_map, sema)?)
+    } else {
+        None
+    };
+
+    checker.leave_scope(return_var)?;
+
+    Ok(return_var.unwrap_or_else(|| checker.void_literal()))
 }
 
 fn process_statement<'db, DB: HirDatabase>(
@@ -75,48 +97,10 @@ fn process_statement<'db, DB: HirDatabase>(
     sema: &Semantics<'db, DB>,
 ) -> Result<(), CheckError> {
     match stmt {
-        ast::Stmt::ExprStmt(expr) => match expr.expr().unwrap() {
-            ast::Expr::BinExpr(expr) => {
-                let lhs = expr.lhs().unwrap();
-                let rhs = expr.rhs().unwrap();
-                match &lhs {
-                    ast::Expr::PathExpr(path) => {
-                        let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
-                        let lhs_var = *locals_map.get(&local).unwrap();
-                        let rhs_var =
-                            resolve_borrow_target(&rhs, checker, locals_map, sema)?;
-                        checker.initialize_var_with_value(lhs_var, rhs_var)?;
-                    }
-                    ast::Expr::PrefixExpr(prefix_expr) => {
-                        if prefix_expr.op_kind().unwrap() != ast::UnaryOp::Deref {
-                            todo!();
-                        }
-                        match &prefix_expr.expr().unwrap() {
-                            ast::Expr::PathExpr(path) => {
-                                let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
-                                let lhs_inner_var = *locals_map.get(&local).unwrap();
-                                let lhs_var = checker.get_deref_var(lhs_inner_var);
-                                let rhs_var = resolve_borrow_target(
-                                    &rhs,
-                                    checker,
-                                    locals_map,
-                                    sema,
-                                )?;
-                                checker.initialize_var_with_value(lhs_var, rhs_var)?;
-                            }
-                            _ => todo!(),
-                        }
-                    }
-                    _ => todo!(),
-                }
-            }
-            ast::Expr::PathExpr(expr) => {
-                let local = resolve_local_ref(expr.path().unwrap(), sema).unwrap();
-                let var = *locals_map.get(&local).unwrap();
-                checker.check_var_usable(var)?;
-            }
-            _ => todo!(),
-        },
+        ast::Stmt::ExprStmt(expr) => {
+            let expr = expr.expr().unwrap();
+            let _ = resolve_borrow_target(&expr, checker, locals_map, sema)?;
+        }
         ast::Stmt::LetStmt(let_stmt) => {
             if let ast::Pat::IdentPat(ident) = let_stmt.pat().unwrap() {
                 let new_local = sema.to_def(&ident).unwrap();
@@ -141,7 +125,7 @@ fn process_statement<'db, DB: HirDatabase>(
 
                 if let Some(init) = let_stmt.initializer() {
                     let rhs = resolve_borrow_target(&init, checker, locals_map, sema)?;
-                    checker.initialize_var_with_value(new_var, rhs)?;
+                    checker.initialize_var_with_value(new_var, vec![rhs])?;
                 }
             } else {
                 todo!();
@@ -155,7 +139,7 @@ fn process_statement<'db, DB: HirDatabase>(
 fn resolve_borrow_target<'db, DB: HirDatabase>(
     expr: &ast::Expr,
     checker: &mut Checker,
-    locals_map: &HashMap<hir::Local, VarId>,
+    locals_map: &mut HashMap<hir::Local, VarId>,
     sema: &Semantics<'db, DB>,
 ) -> Result<VarId, CheckError> {
     match expr {
@@ -164,7 +148,9 @@ fn resolve_borrow_target<'db, DB: HirDatabase>(
         }
         ast::Expr::PathExpr(path) => {
             let local = resolve_local_ref(path.path().unwrap(), sema).unwrap();
-            Ok(*locals_map.get(&local).unwrap())
+            let var = *locals_map.get(&local).unwrap();
+            checker.check_var_usable(var)?;
+            Ok(var)
         }
         ast::Expr::RefExpr(subexpr) => {
             let is_mut_borrow = subexpr.mut_token().is_some();
@@ -173,7 +159,7 @@ fn resolve_borrow_target<'db, DB: HirDatabase>(
 
             let target =
                 resolve_borrow_target(&subexpr.expr().unwrap(), checker, locals_map, sema)?;
-            checker.initialize_var_with_borrow(tmp, target, is_mut_borrow)?;
+            checker.initialize_var_with_borrow(tmp, vec![target], is_mut_borrow)?;
 
             Ok(tmp)
         }
@@ -185,6 +171,53 @@ fn resolve_borrow_target<'db, DB: HirDatabase>(
                 resolve_borrow_target(&prefix_expr.expr().unwrap(), checker, locals_map, sema)?;
 
             Ok(checker.get_deref_var(target))
+        }
+        ast::Expr::BinExpr(bin_expr) => {
+            let lhs = resolve_borrow_target(&bin_expr.lhs().unwrap(), checker, locals_map, sema)?;
+            let rhs = resolve_borrow_target(&bin_expr.rhs().unwrap(), checker, locals_map, sema)?;
+            match bin_expr.op_kind().unwrap() {
+                ast::BinaryOp::LogicOp(_) => todo!(),
+                ast::BinaryOp::ArithOp(_) => todo!(),
+                ast::BinaryOp::CmpOp(_) => todo!(),
+                ast::BinaryOp::Assignment { op } => {
+                    checker.initialize_var_with_value(lhs, vec![rhs])?;
+                    // An assignment returns a new var of type void
+                    Ok(checker.void_literal())
+                }
+            }
+        }
+        ast::Expr::IfExpr(expr) => {
+            let cond = expr.condition().unwrap().expr().unwrap();
+            let _ = resolve_borrow_target(&cond, checker, locals_map, sema)?;
+
+            let mut vars = vec![process_block(
+                &expr.then_branch().unwrap(),
+                checker,
+                locals_map,
+                sema,
+            )?];
+            let mut else_branch = expr.else_branch();
+            while let Some(branch) = &else_branch {
+                match branch {
+                    ast::ElseBranch::Block(block) => {
+                        vars.push(process_block(&block, checker, locals_map, sema)?);
+                        break;
+                    }
+                    ast::ElseBranch::IfExpr(expr) => {
+                        vars.push(process_block(
+                            &expr.then_branch().unwrap(),
+                            checker,
+                            locals_map,
+                            sema,
+                        )?);
+                        else_branch = expr.else_branch();
+                    }
+                }
+            }
+            let expr_value_var = checker.create_var(false, false, "<if rslt>".to_string());
+            checker.initialize_var_with_value(expr_value_var, vars)?;
+
+            Ok(expr_value_var)
         }
         _ => todo!(),
     }
